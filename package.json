@@ -1,0 +1,29 @@
+{
+  "name": "mini-agi",
+  "version": "0.1.0",
+  "description": "A slimmed-down coding agent with Telegram interface and persistent memory",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mariozechner/pi-agent-core": "^0.51.0",
+    "@mariozechner/pi-ai": "^0.51.0",
+    "@sinclair/typebox": "^0.34.33",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.35.0",
+    "parallel-web": "^0.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
