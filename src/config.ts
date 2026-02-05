@@ -11,7 +11,7 @@ export interface Config {
   };
   webSearch: {
     enabled: boolean;
-    apiKey: string;
+    apiKey: string; // Brave Search API key
   };
   memory: {
     enabled: boolean;
@@ -22,6 +22,10 @@ export interface Config {
   };
   workspace: {
     root: string; // Root directory for file operations
+  };
+  mcp: {
+    enabled: boolean;
+    configPath: string; // Path to mcp-servers.json
   };
 }
 
@@ -54,8 +58,8 @@ export function loadConfig(): Config {
       model: optionalEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
     },
     webSearch: {
-      enabled: !!process.env.PARALLEL_API_KEY,
-      apiKey: optionalEnv("PARALLEL_API_KEY", ""),
+      enabled: !!process.env.BRAVE_API_KEY,
+      apiKey: optionalEnv("BRAVE_API_KEY", ""),
     },
     memory: {
       enabled: optionalEnv("MEMORY_ENABLED", "true") === "true",
@@ -72,6 +76,14 @@ export function loadConfig(): Config {
     },
     workspace: {
       root: optionalEnv("WORKSPACE_ROOT", process.cwd()),
+    },
+    mcp: {
+      enabled: optionalEnv("MCP_ENABLED", "true") === "true",
+      // MCP config is part of mini-agi, use cwd (project dir) not workspace
+      configPath: optionalEnv(
+        "MCP_CONFIG_PATH",
+        `${process.cwd()}/mcp-servers.json`
+      ),
     },
   };
 }

@@ -10,9 +10,10 @@ async function main() {
   console.log(`Workspace: ${config.workspace.root}`);
   console.log(`LLM: ${config.llm.provider}/${config.llm.model}`);
   console.log(`Memory: ${config.memory.enabled ? "enabled" : "disabled"}`);
+  console.log(`MCP: ${config.mcp.enabled ? "enabled" : "disabled"}`);
 
-  // Create tool registry
-  const toolRegistry = createToolRegistry(config);
+  // Create tool registry (now async for MCP support)
+  const toolRegistry = await createToolRegistry(config);
   console.log(
     `Tools loaded: ${toolRegistry.tools.map((t) => t.name).join(", ")}`
   );
@@ -24,16 +25,19 @@ async function main() {
   });
 
   // Handle shutdown
-  process.on("SIGINT", () => {
+  const shutdown = async () => {
     console.log("\nShutting down...");
     telegram.stop();
+    await toolRegistry.cleanup();
     process.exit(0);
+  };
+
+  process.on("SIGINT", () => {
+    shutdown();
   });
 
   process.on("SIGTERM", () => {
-    console.log("\nShutting down...");
-    telegram.stop();
-    process.exit(0);
+    shutdown();
   });
 
   // Start the bot
