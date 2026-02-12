@@ -51,10 +51,29 @@ Optional env vars:
 - `AGENT_BROWSER_CDP_PORT` (default: `9222`)
 - `AGENT_BROWSER_AUTO_LAUNCH_CHROME` (default: `true`)
 - `AGENT_BROWSER_AUTO_RESTART_CHROME_FOR_CDP` (default: `true`, macOS)
+- `AGENT_BROWSER_AUTO_BOOTSTRAP_PROFILE` (default: `true`, auto-copies missing named profile into CDP user-data-dir)
 - `AGENT_BROWSER_USE_REGULAR_PROFILE` (default: `true`, reuse your normal Chrome profile/session)
+- `AGENT_BROWSER_CHROME_PROFILE_NAME` (default: `picobot`, resolves by Chrome profile display name)
 - `AGENT_BROWSER_CHROME_USER_DATA_DIR` (optional override for Chrome User Data path)
 - `AGENT_BROWSER_CHROME_PROFILE_DIRECTORY` (optional profile name, e.g. `Default`, `Profile 1`)
 - `AGENT_BROWSER_CHROME_BINARY` (default: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`)
+
+## Long-running task memory
+
+mini-agi now keeps persistent multi-task state automatically from natural language (no `/task` commands needed).
+
+- Active task index: `memory/tasks-{userId}.json`
+- Per-task memory markdown: `memory/tasks/{userId}/{taskId}.md`
+- Task tool used by the agent: `task_memory` (`create_task`, `update_task`, `append_note`, `complete_task`, `list_active_tasks`)
+
+How it works:
+- On each user message, mini-agi loads active tasks and injects them into the system prompt.
+- During execution, the agent updates task state through `task_memory`.
+- After a response, a concise progress note is appended to touched task markdown files.
+
+Optional env vars:
+- `ACTIVE_TASKS_CONTEXT_MAX_CHARS` (default: `3000`)
+- `ACTIVE_TASKS_CONTEXT_MAX_ITEMS` (default: `8`)
 
 ## License
 

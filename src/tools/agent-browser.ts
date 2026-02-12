@@ -15,10 +15,12 @@ export interface AgentBrowserToolOptions {
   cdpPort?: number;
   autoLaunchChrome?: boolean;
   autoRestartChromeForCdp?: boolean;
+  autoBootstrapProfile?: boolean;
   chromeBinaryPath?: string;
   useRegularChromeProfile?: boolean;
   chromeUserDataDir?: string;
   chromeProfileDirectory?: string;
+  chromeProfileName?: string;
 }
 
 const DEFAULT_CHROME_BINARY_PATH =
@@ -75,6 +77,18 @@ function getDefaultChromeUserDataDir(): string | null {
   return null;
 }
 
+function getMainChromeUserDataDir(): string | null {
+  if (process.platform === "darwin") {
+    return path.join(homedir(), "Library/Application Support/Google/Chrome");
+  }
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (!localAppData) return null;
+    return path.join(localAppData, "Google/Chrome/User Data");
+  }
+  return null;
+}
+
 async function detectLastUsedChromeProfile(
   userDataDir: string
 ): Promise<string | null> {
@@ -86,6 +100,140 @@ async function detectLastUsedChromeProfile(
   } catch {
     return null;
   }
+}
+
+async function detectProfileDirectoryByName(
+  userDataDir: string,
+  profileName: string
+): Promise<string | null> {
+  const localStatePath = path.join(userDataDir, "Local State");
+  try {
+    const raw = await fs.readFile(localStatePath, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      profile?: {
+        info_cache?: Record<string, { name?: string }>;
+      };
+    };
+    const infoCache = parsed.profile?.info_cache ?? {};
+    const normalizedTarget = profileName.trim().toLowerCase();
+    for (const [directoryName, meta] of Object.entries(infoCache)) {
+      if ((meta?.name ?? "").trim().toLowerCase() === normalizedTarget) {
+        return directoryName;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function readLocalState(
+  userDataDir: string
+): Promise<Record<string, unknown> | null> {
+  const localStatePath = path.join(userDataDir, "Local State");
+  try {
+    const raw = await fs.readFile(localStatePath, "utf-8");
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function writeLocalState(
+  userDataDir: string,
+  value: Record<string, unknown>
+): Promise<void> {
+  const localStatePath = path.join(userDataDir, "Local State");
+  await fs.mkdir(userDataDir, { recursive: true });
+  await fs.writeFile(localStatePath, JSON.stringify(value), "utf-8");
+}
+
+type ProfileInfoCache = Record<string, { name?: string }>;
+
+function ensureProfileInfoOnState(
+  state: Record<string, unknown>,
+  profileDirectory: string,
+  profileName: string
+): Record<string, unknown> {
+  const profile =
+    typeof state.profile === "object" && state.profile !== null
+      ? (state.profile as Record<string, unknown>)
+      : {};
+  const infoCache =
+    typeof profile.info_cache === "object" && profile.info_cache !== null
+      ? (profile.info_cache as ProfileInfoCache)
+      : {};
+
+  const existing = infoCache[profileDirectory] ?? {};
+  infoCache[profileDirectory] = {
+    ...existing,
+    name: existing.name || profileName,
+  };
+  profile.info_cache = infoCache;
+  profile.last_used = profileDirectory;
+
+  const profilesOrder = Array.isArray(profile.profiles_order)
+    ? (profile.profiles_order as unknown[]).filter(
+        (v): v is string => typeof v === "string"
+      )
+    : [];
+  if (!profilesOrder.includes(profileDirectory)) {
+    profilesOrder.push(profileDirectory);
+  }
+  profile.profiles_order = profilesOrder;
+
+  return {
+    ...state,
+    profile,
+  };
+}
+
+async function bootstrapProfileToUserDataDir(options: {
+  sourceUserDataDir: string;
+  targetUserDataDir: string;
+  profileDirectory: string;
+  profileName: string;
+}): Promise<void> {
+  const {
+    sourceUserDataDir,
+    targetUserDataDir,
+    profileDirectory,
+    profileName,
+  } = options;
+  if (sourceUserDataDir === targetUserDataDir) {
+    return;
+  }
+
+  const sourceProfilePath = path.join(sourceUserDataDir, profileDirectory);
+  const targetProfilePath = path.join(targetUserDataDir, profileDirectory);
+  await fs.mkdir(targetUserDataDir, { recursive: true });
+
+  try {
+    await fs.access(targetProfilePath);
+  } catch {
+    await fs.cp(sourceProfilePath, targetProfilePath, { recursive: true });
+  }
+
+  const sourceState = (await readLocalState(sourceUserDataDir)) ?? {};
+  const targetState = (await readLocalState(targetUserDataDir)) ?? {};
+  const sourceProfileObj =
+    typeof sourceState.profile === "object" && sourceState.profile !== null
+      ? (sourceState.profile as Record<string, unknown>)
+      : {};
+  const sourceInfoCache =
+    typeof sourceProfileObj.info_cache === "object" &&
+    sourceProfileObj.info_cache !== null
+      ? (sourceProfileObj.info_cache as ProfileInfoCache)
+      : {};
+  const sourceProfileName =
+    sourceInfoCache[profileDirectory]?.name?.trim() || profileName;
+
+  const merged = ensureProfileInfoOnState(
+    targetState,
+    profileDirectory,
+    sourceProfileName
+  );
+  await writeLocalState(targetUserDataDir, merged);
 }
 
 function launchChromeWithCdp(
@@ -183,6 +331,8 @@ export function createAgentBrowserTool(
     autoRestartChromeForCdp =
       (process.env.AGENT_BROWSER_AUTO_RESTART_CHROME_FOR_CDP ?? "true") ===
       "true",
+    autoBootstrapProfile =
+      (process.env.AGENT_BROWSER_AUTO_BOOTSTRAP_PROFILE ?? "true") === "true",
     chromeBinaryPath =
       process.env.AGENT_BROWSER_CHROME_BINARY ?? DEFAULT_CHROME_BINARY_PATH,
     useRegularChromeProfile =
@@ -192,13 +342,14 @@ export function createAgentBrowserTool(
       getDefaultChromeUserDataDir() ??
       undefined,
     chromeProfileDirectory = process.env.AGENT_BROWSER_CHROME_PROFILE_DIRECTORY,
+    chromeProfileName = process.env.AGENT_BROWSER_CHROME_PROFILE_NAME ?? "picobot",
   } = options;
 
   return {
     name: "agent_browser",
     label: "Agent Browser",
     description:
-      "Control real Chrome through agent-browser CLI. Use for website interaction, navigation, snapshots, clicking, typing, and screenshots. This tool auto-connects to CDP on port 9222 and tries to start Chrome when needed.",
+      "Control real Chrome through agent-browser CLI. Use for website interaction, navigation, snapshots, clicking, typing, and screenshots. This tool auto-connects to CDP on port 9222, auto-launches/restarts Chrome when needed, and should be attempted before asking the user to manually start Chrome.",
     parameters: Type.Object({
       args: Type.String({
         description:
@@ -229,13 +380,53 @@ export function createAgentBrowserTool(
       });
 
       let resolvedProfileDirectory = chromeProfileDirectory;
-      if (
-        useRegularChromeProfile &&
-        !resolvedProfileDirectory &&
-        chromeUserDataDir
-      ) {
-        resolvedProfileDirectory =
-          (await detectLastUsedChromeProfile(chromeUserDataDir)) ?? "Default";
+      if (useRegularChromeProfile && chromeUserDataDir) {
+        const byName = chromeProfileName?.trim()
+          ? await detectProfileDirectoryByName(chromeUserDataDir, chromeProfileName)
+          : null;
+        if (byName) {
+          resolvedProfileDirectory = byName;
+        }
+
+        if (!byName && autoBootstrapProfile && chromeProfileName?.trim()) {
+          const mainUserDataDir = getMainChromeUserDataDir();
+          if (mainUserDataDir) {
+            const sourceByName = await detectProfileDirectoryByName(
+              mainUserDataDir,
+              chromeProfileName
+            );
+            if (sourceByName) {
+              onUpdate?.({
+                content: [
+                  {
+                    type: "text",
+                    text: `Bootstrapping Chrome profile "${chromeProfileName}" into CDP user data dir...`,
+                  },
+                ],
+                details: {
+                  profileName: chromeProfileName,
+                  sourceDirectory: sourceByName,
+                  targetUserDataDir: chromeUserDataDir,
+                },
+              });
+              await bootstrapProfileToUserDataDir({
+                sourceUserDataDir: mainUserDataDir,
+                targetUserDataDir: chromeUserDataDir,
+                profileDirectory: sourceByName,
+                profileName: chromeProfileName,
+              });
+              resolvedProfileDirectory = sourceByName;
+            }
+          }
+        }
+
+        if (!resolvedProfileDirectory) {
+          resolvedProfileDirectory =
+            byName ||
+            chromeProfileDirectory ||
+            (await detectLastUsedChromeProfile(chromeUserDataDir)) ||
+            "Default";
+        }
       }
 
       const launchArgs = [`--remote-debugging-port=${cdpPort}`];

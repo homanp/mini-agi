@@ -2,6 +2,7 @@ import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { Config } from "../config";
 import { createBashTool } from "./just-bash";
 import { createAgentBrowserTool } from "./agent-browser";
+import { createTaskMemoryTool } from "./task-memory";
 import { createFetchUrlTool } from "./fetch-url";
 import { createWebSearchTool } from "./web-search";
 import { MCPClientManager, loadMCPConfig, convertAllMCPTools } from "../mcp";
@@ -36,6 +37,14 @@ export async function createToolRegistry(
       workspaceRoot: config.workspace.root,
     })
   );
+
+  if (config.memory.enabled) {
+    tools.push(
+      createTaskMemoryTool({
+        memoryDir: config.memory.dir,
+      })
+    );
+  }
 
   // Add web search tool if configured
   if (config.webSearch.enabled) {

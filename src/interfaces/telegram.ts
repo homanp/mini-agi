@@ -2,9 +2,15 @@ import { Bot, Context, type Api, type RawApi } from "grammy";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { Config } from "../config";
 import { createAgent, type MiniAgiAgent } from "../agent/agent";
+import { buildSystemPrompt } from "../prompt";
 import { appendMemoryEntry, ensureMemoryDir } from "../memory/persistent";
 import { loadUserProfile, saveUserProfile } from "../memory/profile";
 import { loadMemoryBootstrap } from "../memory/bootstrap";
+import {
+  appendTaskMemory,
+  consumeTaskTouches,
+  summarizeActiveTasksForPrompt,
+} from "../memory/tasks";
 import {
   loadTranscript,
   appendTranscript,
@@ -48,6 +54,49 @@ export function createTelegramInterface(
   const userAgents = new Map<string, MiniAgiAgent>();
   const agentInitialized = new Map<string, boolean>();
   const onboardingStage = new Map<string, "ask_name" | "ask_tasks">();
+  const activeTasksMaxChars = Number(
+    process.env.ACTIVE_TASKS_CONTEXT_MAX_CHARS ?? "3000"
+  );
+  const activeTasksMaxItems = Number(
+    process.env.ACTIVE_TASKS_CONTEXT_MAX_ITEMS ?? "8"
+  );
+
+  async function buildLiveSystemPrompt(userId: string): Promise<string> {
+    const bootstrap = memoryEnabled
+      ? await loadMemoryBootstrap({ memoryDir: config.memory.dir })
+      : undefined;
+    const profile = memoryEnabled
+      ? await loadUserProfile(config.memory.dir, userId)
+      : null;
+    const activeTasksContext = memoryEnabled
+      ? await summarizeActiveTasksForPrompt(
+          config.memory.dir,
+          userId,
+          Number.isFinite(activeTasksMaxChars) ? activeTasksMaxChars : 3000,
+          Number.isFinite(activeTasksMaxItems) ? activeTasksMaxItems : 8
+        )
+      : undefined;
+
+    return buildSystemPrompt({
+      workspaceRoot: config.workspace.root,
+      bootstrap,
+      activeTasksContext,
+      userProfile: profile
+        ? { name: profile.name, taskPreferences: profile.taskPreferences }
+        : undefined,
+      additionalContext:
+        `Current user id for task_memory tool: ${userId}\n` +
+        "Always pass this exact value in task_memory.user_id.",
+    });
+  }
+
+  async function refreshAgentSystemPrompt(
+    userId: string,
+    agent: MiniAgiAgent
+  ): Promise<void> {
+    const systemPrompt = await buildLiveSystemPrompt(userId);
+    agent.setSystemPrompt(systemPrompt);
+  }
 
   async function getOrCreateAgent(userId: string): Promise<MiniAgiAgent> {
     let agent = userAgents.get(userId);
@@ -62,11 +111,24 @@ export function createTelegramInterface(
         ? await loadUserProfile(config.memory.dir, userId)
         : null;
 
+      const activeTasksContext = memoryEnabled
+        ? await summarizeActiveTasksForPrompt(
+            config.memory.dir,
+            userId,
+            Number.isFinite(activeTasksMaxChars) ? activeTasksMaxChars : 3000,
+            Number.isFinite(activeTasksMaxItems) ? activeTasksMaxItems : 8
+          )
+        : undefined;
+
       console.log(`Creating agent for user: ${userId}`);
       agent = createAgent({
         config,
         tools,
         bootstrap,
+        activeTasksContext,
+        additionalContext:
+          `Current user id for task_memory tool: ${userId}\n` +
+          "Always pass this exact value in task_memory.user_id.",
         userProfile: profile
           ? { name: profile.name, taskPreferences: profile.taskPreferences }
           : undefined,
@@ -217,6 +279,8 @@ export function createTelegramInterface(
 
     // Get or create agent with restored context
     const agent = await getOrCreateAgent(userId);
+    await refreshAgentSystemPrompt(userId, agent);
+    consumeTaskTouches(userId);
 
     // Send typing indicator
     let lastTypingTime = 0;
@@ -260,7 +324,7 @@ export function createTelegramInterface(
             // Throttle message updates
             const now = Date.now();
             if (!sentMessage && responseText.length > 0) {
-              sentMessage = await ctx.reply(responseText);
+              sentMessage = await replyWithFormatting(ctx, responseText);
               lastUpdateTime = now;
             } else if (
               sentMessage &&
@@ -280,6 +344,17 @@ export function createTelegramInterface(
               }
             }
           }
+        } else if (event.type === "message_end") {
+          // Some cached/provider paths may emit no text deltas.
+          // Recover assistant text from the finalized assistant message.
+          if (!responseText.trim()) {
+            const endedText = extractAssistantTextFromMessage(
+              (event as unknown as { message?: unknown }).message
+            );
+            if (endedText.trim()) {
+              responseText = endedText;
+            }
+          }
         } else if (event.type === "tool_execution_start") {
           const toolInfo = `🔧 Running: ${event.toolName}`;
           if (sentMessage) {
@@ -295,6 +370,15 @@ export function createTelegramInterface(
             }
           }
         } else if (event.type === "agent_end") {
+          if (!responseText.trim()) {
+            const fallback = extractAssistantTextFromAgentEnd(
+              event as unknown as { messages?: unknown[] }
+            );
+            if (fallback.trim()) {
+              responseText = fallback;
+            }
+          }
+
           // Final update
           if (responseText.trim()) {
             if (sentMessage) {
@@ -305,11 +389,11 @@ export function createTelegramInterface(
                 responseText
               );
             } else {
-              await ctx.reply(responseText);
+              await replyWithFormatting(ctx, responseText);
             }
           } else {
             if (!sentMessage) {
-              await ctx.reply("Done!");
+              await ctx.reply("I didn't get a response text from the model. Please retry.");
             }
           }
         }
@@ -343,6 +427,28 @@ export function createTelegramInterface(
           console.error("Failed to persist memory:", error);
         }
       }
+
+      if (memoryEnabled && responseText.trim()) {
+        const touchedTasks = consumeTaskTouches(userId);
+        if (touchedTasks.length > 0) {
+          const progressNote = buildTaskProgressNote(userMessage, responseText);
+          for (const touched of touchedTasks) {
+            try {
+              await appendTaskMemory(
+                config.memory.dir,
+                userId,
+                touched.taskId,
+                `${progressNote}\n\nSource action: ${touched.action}`
+              );
+            } catch (error) {
+              console.error(
+                `Failed to append task memory for ${touched.taskId}:`,
+                error
+              );
+            }
+          }
+        }
+      }
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "An unexpected error occurred";
@@ -351,10 +457,10 @@ export function createTelegramInterface(
           ctx.api,
           ctx.chat.id,
           sentMessage.message_id,
-          `❌ Error: ${errorMessage}`
+          `Error: ${errorMessage}`
         );
       } else {
-        await ctx.reply(`❌ Error: ${errorMessage}`);
+        await replyWithFormatting(ctx, `Error: ${errorMessage}`);
       }
     }
   });
@@ -381,8 +487,51 @@ export function createTelegramInterface(
   };
 }
 
+function buildTaskProgressNote(userMessage: string, responseText: string): string {
+  const compact = (text: string, maxLen: number): string => {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (normalized.length <= maxLen) return normalized;
+    return normalized.slice(0, maxLen) + "...";
+  };
+
+  return [
+    `User update: ${compact(userMessage, 350)}`,
+    `Assistant progress: ${compact(responseText, 700)}`,
+  ].join("\n");
+}
+
+function extractAssistantTextFromAgentEnd(event: {
+  messages?: unknown[];
+}): string {
+  const msgs = Array.isArray(event.messages) ? event.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i -= 1) {
+    const text = extractAssistantTextFromMessage(msgs[i]);
+    if (text.trim()) return text;
+  }
+  return "";
+}
+
+function extractAssistantTextFromMessage(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const msg = message as { role?: unknown; content?: unknown };
+  if (msg.role !== "assistant") return "";
+
+  if (typeof msg.content === "string") return msg.content;
+  if (!Array.isArray(msg.content)) return "";
+
+  const parts: string[] = [];
+  for (const block of msg.content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as { type?: unknown; text?: unknown };
+    if (b.type === "text" && typeof b.text === "string") {
+      parts.push(b.text);
+    }
+  }
+  return parts.join("");
+}
+
 /**
- * Helper to edit a message with proper truncation for Telegram's limits.
+ * Helper to edit a message with proper truncation for Telegram limits.
  */
 async function editMessage(
   api: Api<RawApi>,
@@ -391,13 +540,155 @@ async function editMessage(
   text: string
 ): Promise<void> {
   const MAX_LENGTH = 4000;
-  let truncatedText = text;
+  const formatted = formatTelegramOutput(text);
+  let finalText = formatted.text;
+  let finalEntities = formatted.entities;
 
-  if (text.length > MAX_LENGTH) {
-    truncatedText = text.slice(0, MAX_LENGTH) + "\n\n... (truncated)";
+  if (finalText.length > MAX_LENGTH) {
+    const suffix = "\n\n... (truncated)";
+    const cutoff = Math.max(0, MAX_LENGTH - suffix.length);
+    finalText = finalText.slice(0, cutoff) + suffix;
+    finalEntities = trimEntitiesToLength(finalEntities, cutoff);
   }
 
-  await api.editMessageText(chatId, messageId, truncatedText, {
+  try {
+    await api.editMessageText(chatId, messageId, finalText, {
+      parse_mode: undefined,
+      entities: finalEntities.length > 0 ? finalEntities : undefined,
+    });
+  } catch (error) {
+    // Telegram returns 400 when trying to edit to identical content.
+    // Treat this as a no-op so streaming updates remain stable.
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.toLowerCase().includes("message is not modified")) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function replyWithFormatting(ctx: Context, text: string) {
+  const MAX_LENGTH = 4000;
+  const formatted = formatTelegramOutput(text);
+  let finalText = formatted.text;
+  let finalEntities = formatted.entities;
+
+  if (finalText.length > MAX_LENGTH) {
+    const suffix = "\n\n... (truncated)";
+    const cutoff = Math.max(0, MAX_LENGTH - suffix.length);
+    finalText = finalText.slice(0, cutoff) + suffix;
+    finalEntities = trimEntitiesToLength(finalEntities, cutoff);
+  }
+
+  return ctx.reply(finalText, {
     parse_mode: undefined,
+    entities: finalEntities.length > 0 ? finalEntities : undefined,
   });
+}
+
+type TelegramEntity = {
+  type: "bold" | "code" | "pre";
+  offset: number;
+  length: number;
+};
+
+function formatTelegramOutput(text: string): {
+  text: string;
+  entities: TelegramEntity[];
+} {
+  const normalized = normalizeFormattingInput(text);
+  const entities: TelegramEntity[] = [];
+  let out = "";
+  let i = 0;
+
+  while (i < normalized.length) {
+    if (normalized.startsWith("```", i)) {
+      const close = normalized.indexOf("```", i + 3);
+      if (close !== -1) {
+        let block = normalized.slice(i + 3, close);
+        const newlineIdx = block.indexOf("\n");
+        if (newlineIdx !== -1) {
+          const firstLine = block.slice(0, newlineIdx).trim();
+          if (/^[a-zA-Z0-9_+-]{1,32}$/.test(firstLine)) {
+            block = block.slice(newlineIdx + 1);
+          }
+        }
+        const offset = out.length;
+        out += block;
+        if (block.length > 0) {
+          entities.push({ type: "pre", offset, length: block.length });
+        }
+        i = close + 3;
+        continue;
+      }
+    }
+
+    if (normalized.startsWith("**", i)) {
+      const close = normalized.indexOf("**", i + 2);
+      if (close !== -1) {
+        const content = normalized.slice(i + 2, close);
+        const offset = out.length;
+        out += content;
+        if (content.length > 0) {
+          entities.push({ type: "bold", offset, length: content.length });
+        }
+        i = close + 2;
+        continue;
+      }
+    }
+
+    if (normalized[i] === "`") {
+      const close = normalized.indexOf("`", i + 1);
+      if (close !== -1) {
+        const content = normalized.slice(i + 1, close);
+        const offset = out.length;
+        out += content;
+        if (content.length > 0) {
+          entities.push({ type: "code", offset, length: content.length });
+        }
+        i = close + 1;
+        continue;
+      }
+    }
+
+    out += normalized[i];
+    i += 1;
+  }
+
+  return { text: out, entities };
+}
+
+function normalizeFormattingInput(text: string): string {
+  if (!text) return "";
+
+  return text
+    // Convert common HTML-like formatting into marker syntax we can convert to entities.
+    .replace(/<\s*(strong|b)\s*>/gi, "**")
+    .replace(/<\s*\/\s*(strong|b)\s*>/gi, "**")
+    .replace(/<\s*code\s*>/gi, "`")
+    .replace(/<\s*\/\s*code\s*>/gi, "`")
+    .replace(/<\s*pre(?:\s+[^>]*)?\s*>/gi, "```")
+    .replace(/<\s*\/\s*pre\s*>/gi, "```")
+    // Drop leftover tags.
+    .replace(/<\/?[a-zA-Z][^>]*>/g, "")
+    // Decode common entities.
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    // Normalize excessive blank lines for readability.
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function trimEntitiesToLength(
+  entities: TelegramEntity[],
+  maxLength: number
+): TelegramEntity[] {
+  return entities
+    .filter((entity) => entity.offset < maxLength)
+    .map((entity) => ({
+      ...entity,
+      length: Math.min(entity.length, maxLength - entity.offset),
+    }))
+    .filter((entity) => entity.length > 0);
 }

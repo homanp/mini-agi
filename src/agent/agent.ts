@@ -11,6 +11,7 @@ export interface MiniAgiAgent {
   prompt(message: string): AsyncGenerator<AgentEvent>;
   abort(): void;
   reset(): void;
+  setSystemPrompt(prompt: string): void;
   getMessages(): unknown[];
   restoreMessages(
     messages: Array<{ role: string; content: string; timestamp: number }>
@@ -23,6 +24,8 @@ export interface CreateAgentOptions {
   tools: AgentTool[];
   onEvent?: (event: AgentEvent) => void;
   bootstrap?: string;
+  activeTasksContext?: string;
+  additionalContext?: string;
   userProfile?: {
     name: string;
     taskPreferences: string;
@@ -30,13 +33,23 @@ export interface CreateAgentOptions {
 }
 
 export function createAgent(options: CreateAgentOptions): MiniAgiAgent {
-  const { config, tools, onEvent, bootstrap, userProfile } = options;
+  const {
+    config,
+    tools,
+    onEvent,
+    bootstrap,
+    activeTasksContext,
+    additionalContext,
+    userProfile,
+  } = options;
 
   // Cast needed because provider/model come from config at runtime
   const model = getModel(config.llm.provider as any, config.llm.model as any);
   const systemPrompt = buildSystemPrompt({
     workspaceRoot: config.workspace.root,
     bootstrap,
+    activeTasksContext,
+    additionalContext,
     userProfile,
   });
 
@@ -101,6 +114,13 @@ export function createAgent(options: CreateAgentOptions): MiniAgiAgent {
 
     reset() {
       agent.reset();
+    },
+
+    setSystemPrompt(prompt: string) {
+      // pi-agent-core exposes setSystemPrompt for runtime context refresh.
+      (agent as unknown as { setSystemPrompt: (p: string) => void }).setSystemPrompt(
+        prompt
+      );
     },
 
     getMessages() {
