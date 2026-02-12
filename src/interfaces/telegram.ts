@@ -36,11 +36,11 @@ export function createTelegramInterface(
 
   // Initialize directories
   if (memoryEnabled) {
-    ensureMemoryDir(config.memory.dir).catch((err) => {
+    ensureMemoryDir(config.memory.dir).catch((err: unknown) => {
       console.error("Failed to initialize memory directory:", err);
     });
   }
-  ensureSessionDir(config.session.dir).catch((err) => {
+  ensureSessionDir(config.session.dir).catch((err: unknown) => {
     console.error("Failed to initialize session directory:", err);
   });
 

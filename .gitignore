@@ -27,8 +27,8 @@ Thumbs.db
 bun.lockb
 
 # Session and memory data
-session/
-*.jsonl
+/session/
+/*.jsonl
 
 # Temporary files
 tmp/

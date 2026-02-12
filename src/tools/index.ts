@@ -1,6 +1,7 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { Config } from "../config";
 import { createBashTool } from "./just-bash";
+import { createAgentBrowserTool } from "./agent-browser";
 import { createFetchUrlTool } from "./fetch-url";
 import { createWebSearchTool } from "./web-search";
 import { MCPClientManager, loadMCPConfig, convertAllMCPTools } from "../mcp";
@@ -25,6 +26,13 @@ export async function createToolRegistry(
   // Add bash tool
   tools.push(
     createBashTool({
+      workspaceRoot: config.workspace.root,
+    })
+  );
+
+  // Add dedicated browser automation tool (auto CDP + auto launch)
+  tools.push(
+    createAgentBrowserTool({
       workspaceRoot: config.workspace.root,
     })
   );
