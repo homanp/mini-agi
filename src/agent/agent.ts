@@ -9,7 +9,10 @@ import { buildSystemPrompt } from "../prompt";
 
 export interface MiniAgiAgent {
   prompt(message: string): AsyncGenerator<AgentEvent>;
+  continue(): AsyncGenerator<AgentEvent>;
   abort(): void;
+  waitForIdle(): Promise<void>;
+  isStreaming(): boolean;
   reset(): void;
   setSystemPrompt(prompt: string): void;
   getMessages(): unknown[];
@@ -66,50 +69,70 @@ export function createAgent(options: CreateAgentOptions): MiniAgiAgent {
     agent.subscribe(onEvent);
   }
 
+  async function* runWith(
+    runner: () => Promise<void>
+  ): AsyncGenerator<AgentEvent> {
+    const eventQueue: AgentEvent[] = [];
+    let resolveWait: (() => void) | null = null;
+    let done = false;
+
+    const unsubscribe = agent.subscribe((event) => {
+      eventQueue.push(event);
+      if (resolveWait) {
+        resolveWait();
+        resolveWait = null;
+      }
+      if (event.type === "agent_end") {
+        done = true;
+      }
+    });
+
+    runner().catch((err) => {
+      eventQueue.push({
+        type: "agent_end",
+        messages: [],
+        error: err instanceof Error ? err.message : String(err),
+      } as AgentEvent);
+      done = true;
+    });
+
+    try {
+      while (!done || eventQueue.length > 0) {
+        if (eventQueue.length > 0) {
+          yield eventQueue.shift()!;
+        } else {
+          await new Promise<void>((resolve) => {
+            resolveWait = resolve;
+          });
+        }
+      }
+    } finally {
+      unsubscribe();
+    }
+  }
+
   return {
     async *prompt(message: string) {
-      const eventQueue: AgentEvent[] = [];
-      let resolveWait: (() => void) | null = null;
-      let done = false;
+      yield* runWith(() => agent.prompt(message));
+    },
 
-      const unsubscribe = agent.subscribe((event) => {
-        eventQueue.push(event);
-        if (resolveWait) {
-          resolveWait();
-          resolveWait = null;
-        }
-        if (event.type === "agent_end") {
-          done = true;
-        }
-      });
-
-      // Start the prompt
-      agent.prompt(message).catch((err) => {
-        eventQueue.push({
-          type: "agent_end",
-          messages: [],
-          error: err instanceof Error ? err.message : String(err),
-        } as AgentEvent);
-        done = true;
-      });
-
-      try {
-        while (!done || eventQueue.length > 0) {
-          if (eventQueue.length > 0) {
-            yield eventQueue.shift()!;
-          } else {
-            await new Promise<void>((resolve) => {
-              resolveWait = resolve;
-            });
-          }
-        }
-      } finally {
-        unsubscribe();
-      }
+    async *continue() {
+      yield* runWith(() => agent.continue());
     },
 
     abort() {
       agent.abort();
+    },
+
+    waitForIdle() {
+      return (
+        (agent as unknown as { waitForIdle?: () => Promise<void> }).waitForIdle?.() ??
+        Promise.resolve()
+      );
+    },
+
+    isStreaming() {
+      return Boolean((agent as unknown as { state?: { isStreaming?: boolean } }).state?.isStreaming);
     },
 
     reset() {

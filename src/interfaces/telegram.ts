@@ -52,6 +52,7 @@ export function createTelegramInterface(
 
   // Per-user agent instances (simple session management)
   const userAgents = new Map<string, MiniAgiAgent>();
+  const userRunId = new Map<string, number>();
   const agentInitialized = new Map<string, boolean>();
   const onboardingStage = new Map<string, "ask_name" | "ask_tasks">();
   const activeTasksMaxChars = Number(
@@ -155,6 +156,19 @@ export function createTelegramInterface(
     return agent;
   }
 
+  function shouldContinueOnEmptyResponse(errorMessage: string): boolean {
+    if (!errorMessage.trim()) return false;
+    const msg = errorMessage.toLowerCase();
+    return (
+      msg.includes("context") ||
+      msg.includes("too long") ||
+      msg.includes("maximum") ||
+      msg.includes("token limit") ||
+      msg.includes("prompt is too long") ||
+      msg.includes("input is too long")
+    );
+  }
+
   function isUserAllowed(ctx: Context): boolean {
     const allowedUsers = config.telegram.allowedUsers;
     if (allowedUsers.length === 0) {
@@ -198,6 +212,7 @@ export function createTelegramInterface(
         agent.reset();
       }
       userAgents.delete(userId);
+      userRunId.delete(userId);
       agentInitialized.delete(userId);
       onboardingStage.delete(userId);
 
@@ -226,178 +241,245 @@ export function createTelegramInterface(
     if (!userId) return;
 
     const userMessage = ctx.message.text;
+    const currentRunId = (userRunId.get(userId) ?? 0) + 1;
+    userRunId.set(userId, currentRunId);
+    const isCurrentRun = () => userRunId.get(userId) === currentRunId;
 
-    // Load or initialize user profile
-    let profile = memoryEnabled
-      ? await loadUserProfile(config.memory.dir, userId)
-      : null;
+    // Run processing detached so this update handler returns immediately.
+    // This allows subsequent Telegram messages to be handled right away and interrupt.
+    void (async () => {
+      // Load or initialize user profile
+      let profile = memoryEnabled
+        ? await loadUserProfile(config.memory.dir, userId)
+        : null;
 
-    // Handle onboarding if no profile
-    if (memoryEnabled && !profile) {
-      const stage = onboardingStage.get(userId) ?? "ask_name";
-      onboardingStage.set(userId, stage);
+      // Handle onboarding if no profile
+      if (memoryEnabled && !profile) {
+        if (!isCurrentRun()) return;
+        const stage = onboardingStage.get(userId) ?? "ask_name";
+        onboardingStage.set(userId, stage);
 
-      if (stage === "ask_name") {
-        onboardingStage.set(userId, "ask_tasks");
-        await ctx.reply("Hi! I'm mini-agi. What name should I call you?");
-        return;
-      }
-
-      if (stage === "ask_tasks") {
-        const existingProfile = await loadUserProfile(
-          config.memory.dir,
-          userId
-        );
-        if (!existingProfile?.name) {
-          // Save name and ask for tasks
-          await saveUserProfile(config.memory.dir, {
-            userId,
-            name: userMessage.trim(),
-            taskPreferences: "",
-            updatedAt: new Date().toISOString(),
-          });
-          await ctx.reply(
-            `Nice to meet you, ${userMessage.trim()}! What kinds of tasks do you want me to help with?`
-          );
+        if (stage === "ask_name") {
+          onboardingStage.set(userId, "ask_tasks");
+          if (!isCurrentRun()) return;
+          await ctx.reply("Hi! I'm mini-agi. What name should I call you?");
           return;
         }
 
-        // Save task preferences
-        await saveUserProfile(config.memory.dir, {
-          userId,
-          name: existingProfile.name,
-          taskPreferences: userMessage.trim(),
-          updatedAt: new Date().toISOString(),
-        });
-        onboardingStage.delete(userId);
-        await ctx.reply(
-          "Got it. Thanks! You can now ask me anything, and I'll remember this."
-        );
-        return;
-      }
-    }
-
-    // Get or create agent with restored context
-    const agent = await getOrCreateAgent(userId);
-    await refreshAgentSystemPrompt(userId, agent);
-    consumeTaskTouches(userId);
-
-    // Send typing indicator
-    let lastTypingTime = 0;
-    const TYPING_INTERVAL = 4000;
-
-    let responseText = "";
-    let lastUpdateTime = 0;
-    const UPDATE_INTERVAL = 1000;
-    let sentMessage: Awaited<ReturnType<typeof ctx.reply>> | null = null;
-
-    try {
-      // Kick off typing indicator
-      try {
-        await ctx.replyWithChatAction("typing");
-        lastTypingTime = Date.now();
-      } catch {
-        // Ignore rate limit errors
-      }
-      await new Promise((resolve) => setTimeout(resolve, 800));
-
-      for await (const event of agent.prompt(userMessage)) {
-        // Debug: log all events
-        console.log(`[${userId}] Event: ${event.type}`, JSON.stringify(event).slice(0, 200));
-
-        // Keep typing indicator active
-        const nowTyping = Date.now();
-        if (nowTyping - lastTypingTime > TYPING_INTERVAL) {
-          lastTypingTime = nowTyping;
-          try {
-            await ctx.replyWithChatAction("typing");
-          } catch {
-            // Ignore rate limit errors
+        if (stage === "ask_tasks") {
+          const existingProfile = await loadUserProfile(
+            config.memory.dir,
+            userId
+          );
+          if (!existingProfile?.name) {
+            // Save name and ask for tasks
+            await saveUserProfile(config.memory.dir, {
+              userId,
+              name: userMessage.trim(),
+              taskPreferences: "",
+              updatedAt: new Date().toISOString(),
+            });
+            if (!isCurrentRun()) return;
+            await ctx.reply(
+              `Nice to meet you, ${userMessage.trim()}! What kinds of tasks do you want me to help with?`
+            );
+            return;
           }
+
+          // Save task preferences
+          await saveUserProfile(config.memory.dir, {
+            userId,
+            name: existingProfile.name,
+            taskPreferences: userMessage.trim(),
+            updatedAt: new Date().toISOString(),
+          });
+          onboardingStage.delete(userId);
+          if (!isCurrentRun()) return;
+          await ctx.reply(
+            "Got it. Thanks! You can now ask me anything, and I'll remember this."
+          );
+          return;
         }
+      }
 
-        if (event.type === "message_update") {
-          const msgEvent = event.assistantMessageEvent;
-          if (msgEvent.type === "text_delta") {
-            responseText += msgEvent.delta;
+      // Send typing indicator
+      let lastTypingTime = 0;
+      const TYPING_INTERVAL = 4000;
 
-            // Throttle message updates
-            const now = Date.now();
-            if (!sentMessage && responseText.length > 0) {
-              sentMessage = await replyWithFormatting(ctx, responseText);
-              lastUpdateTime = now;
-            } else if (
-              sentMessage &&
-              now - lastUpdateTime > UPDATE_INTERVAL &&
-              responseText.length > 0
-            ) {
-              lastUpdateTime = now;
+      let responseText = "";
+      let lastUpdateTime = 0;
+      const UPDATE_INTERVAL = 1000;
+      let sentMessage: Awaited<ReturnType<typeof ctx.reply>> | null = null;
+
+      try {
+        // Kick off typing indicator
+        try {
+          await ctx.replyWithChatAction("typing");
+          lastTypingTime = Date.now();
+        } catch {
+          // Ignore rate limit errors
+        }
+        await new Promise((resolve) => setTimeout(resolve, 800));
+
+      const MAX_CONTINUE_RETRIES = 1;
+      let continueRetries = 0;
+      const agent = await getOrCreateAgent(userId);
+      if (agent.isStreaming()) {
+        agent.abort();
+        await agent.waitForIdle();
+      }
+      if (!isCurrentRun()) return;
+      await refreshAgentSystemPrompt(userId, agent);
+      consumeTaskTouches(userId);
+      if (!isCurrentRun()) return;
+
+      while (true) {
+        responseText = "";
+        let agentEndError = "";
+        const stream =
+          continueRetries > 0 ? agent.continue() : agent.prompt(userMessage);
+
+        for await (const event of stream) {
+          if (!isCurrentRun()) {
+            break;
+          }
+          // Debug: log all events
+          console.log(
+            `[${userId}] Event: ${event.type}`,
+            JSON.stringify(event).slice(0, 200)
+          );
+
+          // Keep typing indicator active
+          const nowTyping = Date.now();
+          if (nowTyping - lastTypingTime > TYPING_INTERVAL) {
+            lastTypingTime = nowTyping;
+            try {
+              await ctx.replyWithChatAction("typing");
+            } catch {
+              // Ignore rate limit errors
+            }
+          }
+
+          if (event.type === "message_update") {
+            const msgEvent = event.assistantMessageEvent;
+            if (msgEvent.type === "text_delta") {
+              responseText += msgEvent.delta;
+
+              // Throttle message updates
+              const now = Date.now();
+              if (!sentMessage && responseText.length > 0) {
+                if (!isCurrentRun()) break;
+                sentMessage = await replyWithFormatting(ctx, responseText);
+                lastUpdateTime = now;
+              } else if (
+                sentMessage &&
+                now - lastUpdateTime > UPDATE_INTERVAL &&
+                responseText.length > 0
+              ) {
+                lastUpdateTime = now;
+                if (!isCurrentRun()) break;
+                try {
+                  await editMessage(
+                    ctx.api,
+                    ctx.chat.id,
+                    sentMessage.message_id,
+                    responseText
+                  );
+                } catch {
+                  // Ignore edit errors
+                }
+              }
+            }
+          } else if (event.type === "message_end") {
+            // Some cached/provider paths may emit no text deltas.
+            // Recover assistant text from the finalized assistant message.
+            if (!responseText.trim()) {
+              const endedText = extractAssistantTextFromMessage(
+                (event as unknown as { message?: unknown }).message
+              );
+              if (endedText.trim()) {
+                responseText = endedText;
+              }
+            }
+          } else if (event.type === "tool_execution_start") {
+            const toolInfo = `🔧 Running: ${event.toolName}`;
+            if (sentMessage) {
+              if (!isCurrentRun()) break;
               try {
                 await editMessage(
                   ctx.api,
                   ctx.chat.id,
                   sentMessage.message_id,
-                  responseText
+                  responseText + (responseText ? "\n\n" : "") + toolInfo
                 );
               } catch {
                 // Ignore edit errors
               }
             }
-          }
-        } else if (event.type === "message_end") {
-          // Some cached/provider paths may emit no text deltas.
-          // Recover assistant text from the finalized assistant message.
-          if (!responseText.trim()) {
-            const endedText = extractAssistantTextFromMessage(
-              (event as unknown as { message?: unknown }).message
-            );
-            if (endedText.trim()) {
-              responseText = endedText;
-            }
-          }
-        } else if (event.type === "tool_execution_start") {
-          const toolInfo = `🔧 Running: ${event.toolName}`;
-          if (sentMessage) {
-            try {
-              await editMessage(
-                ctx.api,
-                ctx.chat.id,
-                sentMessage.message_id,
-                responseText + (responseText ? "\n\n" : "") + toolInfo
+          } else if (event.type === "agent_end") {
+            if (!responseText.trim()) {
+              const fallback = extractAssistantTextFromAgentEnd(
+                event as unknown as { messages?: unknown[] }
               );
-            } catch {
-              // Ignore edit errors
+              if (fallback.trim()) {
+                responseText = fallback;
+              }
             }
-          }
-        } else if (event.type === "agent_end") {
-          if (!responseText.trim()) {
-            const fallback = extractAssistantTextFromAgentEnd(
-              event as unknown as { messages?: unknown[] }
-            );
-            if (fallback.trim()) {
-              responseText = fallback;
-            }
-          }
-
-          // Final update
-          if (responseText.trim()) {
-            if (sentMessage) {
-              await editMessage(
-                ctx.api,
-                ctx.chat.id,
-                sentMessage.message_id,
-                responseText
-              );
-            } else {
-              await replyWithFormatting(ctx, responseText);
-            }
-          } else {
-            if (!sentMessage) {
-              await ctx.reply("I didn't get a response text from the model. Please retry.");
+            const err = (event as unknown as { error?: unknown }).error;
+            if (typeof err === "string") {
+              agentEndError = err;
             }
           }
         }
+
+        if (responseText.trim()) {
+          if (!isCurrentRun()) return;
+          if (sentMessage) {
+            await editMessage(
+              ctx.api,
+              ctx.chat.id,
+              sentMessage.message_id,
+              responseText
+            );
+          } else {
+            sentMessage = await replyWithFormatting(ctx, responseText);
+          }
+          break;
+        }
+
+        const shouldContinue =
+          shouldContinueOnEmptyResponse(agentEndError) || responseText.trim() === "";
+
+        if (continueRetries < MAX_CONTINUE_RETRIES && shouldContinue) {
+          continueRetries += 1;
+          if (!isCurrentRun()) return;
+          if (sentMessage) {
+            await editMessage(
+              ctx.api,
+              ctx.chat.id,
+              sentMessage.message_id,
+              "No response text yet. Continuing automatically..."
+            );
+          } else {
+            sentMessage = await replyWithFormatting(
+              ctx,
+              "No response text yet. Continuing automatically..."
+            );
+          }
+          continue;
+        }
+
+        if (!sentMessage) {
+          if (!isCurrentRun()) return;
+          await replyWithFormatting(
+            ctx,
+            "I couldn't produce a response this turn. Please retry."
+          );
+        }
+        break;
       }
+
+      if (!isCurrentRun()) return;
 
       // Save to transcript (JSONL)
       const timestamp = Date.now();
@@ -449,20 +531,24 @@ export function createTelegramInterface(
           }
         }
       }
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "An unexpected error occurred";
-      if (sentMessage) {
-        await editMessage(
-          ctx.api,
-          ctx.chat.id,
-          sentMessage.message_id,
-          `Error: ${errorMessage}`
-        );
-      } else {
-        await replyWithFormatting(ctx, `Error: ${errorMessage}`);
+      } catch (error) {
+        if (!isCurrentRun()) return;
+        const errorMessage =
+          error instanceof Error ? error.message : "An unexpected error occurred";
+        if (sentMessage) {
+          await editMessage(
+            ctx.api,
+            ctx.chat.id,
+            sentMessage.message_id,
+            `Error: ${errorMessage}`
+          );
+        } else {
+          await replyWithFormatting(ctx, `Error: ${errorMessage}`);
+        }
       }
-    }
+    })().catch((error) => {
+      console.error(`[${userId}] Deferred message handler error:`, error);
+    });
   });
 
   // Error handler
